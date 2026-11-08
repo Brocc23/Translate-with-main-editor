@@ -162,16 +162,16 @@ If every line in the chunk is `certainty: 3`, write `"has_difficult_passages": f
 
 The parent agent performs the editorial review once Stage 1 has finished. Rather than relying solely on the fast model's self-reported confusion, `review_flags.py dump` automatically runs `auto_flag.py` to combine **model flags** + **deterministic script flags** + **chunk risk tiers** + a **5% random spot-audit** (`[AUDIT-5%]`).
 
-1. **Dump prioritized review queue (Full Review by default).** For large books, review in volume or chapter slices to avoid overflowing context:
+1. **Dump prioritized review queue.** For large books, review in volume or chapter slices to avoid overflowing context:
    ```bash
    python "<skill_dir>/scripts/review_flags.py" dump "<work_dir>/book_temp" \
      --chunks "1-20" \
      --min-severity low \
-     --high-risk-mode full \
+     --high-risk-mode opening-closing \
      --out "<work_dir>/book_temp/all_flags.txt"
    ```
    - Items inside each chunk are sorted by priority: `[HIGH]` $\rightarrow$ `[MEDIUM]` $\rightarrow$ `[LOW]` $\rightarrow$ `[AUDIT-5%]`.
-   - By default (`--high-risk-mode full` and `--min-severity low`), chunks marked `[RISK TIER: HIGH]` (opening/closing chunks, multi-section transitions, or high new-entity counts) also include a `--- FULL CHUNK REVIEW ---` block with every line (`SRC` + `CUR`) so the Main Editor reviews those high-risk chapters end-to-end.
+   - By default (`--high-risk-mode opening-closing` and `--min-severity low`), the opening and closing chunks of the book include a `--- FULL CHUNK REVIEW ---` block with every line (`SRC` + `CUR`) so the Main Editor sets and closes the book's narrative voice end-to-end without drowning in full-text dumps of middle chapters (pass `--high-risk-mode full` to dump all high-risk chunks in full, or `--high-risk-mode flags` for flags only).
    - If token quota is tight, pass `--min-severity medium --high-risk-mode flags` so critical errors are resolved first.
 2. **Inspect and refine.** Read the dump (and surrounding lines of `chunkNNNN.md` / `output_chunkNNNN.md` when more context is needed). Resolve every omitted pronoun, attribution ambiguity, glossary violation, pun, header/TOC mismatch, and `[AUDIT-5%]` line by editing `output_chunkNNNN.md` directly. Keep tags and line counts unchanged.
 3. **Check the Measured Spot-Audit Miss Rate**:

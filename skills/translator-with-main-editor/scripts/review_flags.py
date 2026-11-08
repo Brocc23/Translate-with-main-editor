@@ -139,6 +139,7 @@ def cmd_dump(args):
         # 2. Run deterministic script-side heuristics unless disabled
         auto_res = {
             "risk_tier": "normal",
+            "is_opening_or_closing": False,
             "risk_reasons": [],
             "flags": [],
             "audit_lines": [],
@@ -230,7 +231,11 @@ def cmd_dump(args):
             if 1 <= ln < len(olines):
                 lines_out.append(f"  Next (L{ln+1}): {olines[ln]}")
 
-        if auto_res["risk_tier"] == "high" and args.high_risk_mode == "full":
+        do_full_chunk_dump = (
+            (args.high_risk_mode == "full" and auto_res["risk_tier"] == "high")
+            or (args.high_risk_mode == "opening-closing" and auto_res.get("is_opening_or_closing"))
+        )
+        if do_full_chunk_dump:
             lines_out.append(f"--- FULL CHUNK REVIEW: {cid} ({len(slines)} lines, High-Risk Chunk) ---")
             max_ln = max(len(slines), len(olines))
             for idx in range(max_ln):
@@ -373,7 +378,7 @@ def main():
     p_dump.add_argument("temp_dir", help="Path to working chunk directory")
     p_dump.add_argument("--chunks", default=None, help="Optional chunk range filter, e.g. '1-8,11-20'")
     p_dump.add_argument("--min-severity", choices=["low", "medium", "high"], default="low", help="Minimum flag severity to include (default: low = full review)")
-    p_dump.add_argument("--high-risk-mode", choices=["full", "flags"], default="full", help="For High-Risk chunks, dump the entire chunk ('full', default) or only flagged lines ('flags')")
+    p_dump.add_argument("--high-risk-mode", choices=["opening-closing", "full", "flags"], default="opening-closing", help="Dump full chunk for opening/closing chunks only ('opening-closing', default), all high-risk chunks ('full'), or flagged lines only ('flags')")
     p_dump.add_argument("--audit-rate", type=float, default=0.05, help="Fraction of unflagged lines to sample for 5%% random spot-audit (default: 0.05, 0 to disable)")
     p_dump.add_argument("--no-auto-flag", action="store_true", help="Disable deterministic script-side heuristics and dump only model .review.json flags")
     p_dump.add_argument("--reset-audit-snapshot", action="store_true", help="Overwrite existing audit_snapshot.json baseline with current chunk lines")

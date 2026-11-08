@@ -7,14 +7,17 @@ Detects objective risk signals that a fast drafting model (e.g. Flash / Haiku)
 often misses because models are frequently overconfident when resolving omitted
 pronouns, speaker turns, or glossary terms:
   1. Untranslated source-script residue in the target output (`high`)
+     - Exempts translator notes (`TL Note:`) and censored blocks (`■■ェ■■■`).
   2. Glossary term violations where source/alias appears in source line but canonical
-     target is missing in output line (`high`)
-  3. Source-to-output length-ratio outliers indicating dropped clauses or padding (`high`/`medium`)
-  4. Unattributed consecutive dialogue runs (>= 3 quote-only lines in a row) (`medium`)
+     target (including plural/inflected forms like Enemy -> Enemies) is missing (`high`)
+  3. Source-to-output length-ratio outliers on source-script lines (`high`/`medium`)
+     - Skips lines that are already predominantly Latin/English in the source.
+  4. Unattributed consecutive dialogue runs (>= 6 quote-only lines with no recent
+     character name attribution) (`medium`)
   5. Zero-pronoun / POV-shift ambiguity in pro-drop languages (ja/zh/ko) where output
      injects pronouns without explicit source pronouns (`medium`)
-  6. Ruby (<ruby>/<rt>), bouten (em-sesame), or special bracketed wordplay (`low`/`medium`)
-  7. Chunk-level Risk Tiers (opening/closing chunks, chapter starts, high new-entity count)
+  6. Ruby (<ruby>/<rt>), bouten (em-sesame), or special bracketed wordplay (`low`)
+  7. Chunk-level Risk Tiers (opening/closing chunks, heavy section transitions, glossary conflicts)
   8. Deterministic 5% Random Spot-Audit sampling of unflagged lines to measure miss rate.
 """
 import sys as _sys
@@ -40,16 +43,24 @@ HIRAGANA_KATAKANA_RE = re.compile(r'[\u3040-\u309f\u30a0-\u30ff]')
 HANGUL_RE = re.compile(r'[\uac00-\ud7af\u1100-\u11ff]')
 CYRILLIC_RE = re.compile(r'[\u0400-\u04ff]')
 ARABIC_RE = re.compile(r'[\u0600-\u06ff]')
+LATIN_ALPHA_RE = re.compile(r'[A-Za-z]')
+
+# Intentional untranslated exemptions (TL notes & censored blocks like ■■ェ■■■)
+TL_NOTE_RE = re.compile(r'(?:\bTL\s*Note\b|\bTranslator\'?s?\s*Note\b|\bT/N\b)', re.IGNORECASE)
+CENSOR_BLOCK_RE = re.compile(r'[■□▲△●○×✕◆◇]{1,}[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]*[■□▲△●○×✕◆◇]{1,}')
 
 # Dialogue & structural patterns
 DIALOGUE_OPEN_RE = re.compile(r'^\s*(?:「|『|“|"|\'|—|―|–)')
 DIALOGUE_CLOSE_SRC_RE = re.compile(r'(?:」|』|”|")\s*$')
-DIALOGUE_CLOSE_TGT_RE = re.compile(r'(?:”|"|\')\s*$')
 
-# Explicit source pronouns in ZH / JA / KO
-ZH_PRONOUN_RE = re.compile(r'(?:我|你|您|他|她|它|咱们|我们|你们|他们|她们|自己|本人|家伙|那家伙|这家伙)')
+# Explicit source pronouns in ZH / JA / KO (Korean uses particle/boundary anchors to avoid matching inside words)
+ZH_PRONOUN_RE = re.compile(r'(?:我|你|您|他|她|它|咱们|我们|你们|他们|她们|自己|本人|那家伙|这家伙)')
 JA_PRONOUN_RE = re.compile(r'(?:私|僕|俺|あたし|わたし|ぼく|おれ|彼|彼女|あなた|君|きみ|あんた|自分|彼ら)')
-KO_PRONOUN_RE = re.compile(r'(?:나|내|저|제|너|네|그|그녀|우리|저희|그들|자신)')
+KO_PRONOUN_RE = re.compile(
+    r'(?:^|[\s「『“"\'(\[])'
+    r'(?:(?:나|저|너|그|그녀|우리|저희|그들|자신)(?:는|은|가|이|도|만|를|을|의|에게|한테|께|랑|와|과)(?=$|[\s,.!?」』”"\')\]]))'
+    r'|(?:^|[\s「『“"\'(\[])(?:내|제|네)\s+'
+)
 
 # English / Latin target pronouns that often get hallucinated or misattributed from zero-pronoun sources
 EN_THIRD_OR_FIRST_PRONOUN_RE = re.compile(r'\b(?:I|my|me|myself|he|him|his|himself|she|her|hers|herself|they|them|their)\b', re.IGNORECASE)
@@ -73,8 +84,8 @@ def load_config_langs(temp_dir: Path):
             data = json.loads(epub_map_path.read_text(encoding="utf-8"))
             source_lang = data.get("source_lang", source_lang)
             target_lang = data.get("target_lang", target_lang)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"WARNING: Failed to read {epub_map_path}: {e}", file=_sys.stderr)
     cfg_path = temp_dir / "config.txt"
     if cfg_path.exists():
         for line in cfg_path.read_text(encoding="utf-8").splitlines():
@@ -96,47 +107,100 @@ def load_glossary_terms(temp_dir: Path):
             return list(terms.values())
         if isinstance(terms, list):
             return terms
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"WARNING: Failed to parse glossary at {gpath}: {e}", file=_sys.stderr)
     return []
+
+
+def _normalize_en_word(w: str) -> str:
+    """Normalize an English word to its singular/base stem for plural-tolerant glossary matching."""
+    w = re.sub(r"(?:'s|s')$", "", w.lower().strip(".,!?;:\"'()[]{}—–-"))
+    if len(w) > 4 and w.endswith("ies"):
+        return w[:-3] + "y"
+    if len(w) > 4 and w.endswith("ves"):
+        return w[:-3] + "f"
+    if len(w) > 4 and (w.endswith("ses") or w.endswith("xes") or w.endswith("zes") or w.endswith("ches") or w.endswith("shes")):
+        return w[:-2]
+    if len(w) > 3 and w.endswith("s") and not w.endswith("ss") and not w.endswith("us"):
+        return w[:-1]
+    return w
+
+
+def glossary_target_matches(tgt_term: str, oplain: str) -> bool:
+    """Check if `tgt_term` (or its plural/inflected form, e.g. 'Enemies of the World' for 'Enemy of the World') appears in `oplain`."""
+    oplain_low = oplain.lower()
+    if tgt_term.lower() in oplain_low:
+        return True
+    core_tgt = re.sub(r'^(?:the|a|an)\s+', '', tgt_term, flags=re.IGNORECASE).strip()
+    if core_tgt.lower() in oplain_low:
+        return True
+
+    # Build plural/possessive regex for core_tgt (handles multi-word phrases like "Enemy of the World" -> "Enemies of the World")
+    tgt_words = [w for w in re.split(r'\W+', core_tgt) if len(w) >= 3 and w.lower() not in ("the", "and", "for", "from", "with")]
+    if not tgt_words:
+        return True
+    out_words_norm = {_normalize_en_word(w) for w in re.split(r'\W+', oplain) if w}
+    if all(_normalize_en_word(tw) in out_words_norm for tw in tgt_words):
+        return True
+    return False
+
+
+def count_source_script_chars(text: str, source_lang: str) -> int:
+    """Count characters belonging to the non-Latin source script (or non-ASCII if auto)."""
+    if source_lang.startswith(("zh", "ja", "auto")):
+        cjk_kana = len(CJK_UNIFIED_RE.findall(text)) + len(HIRAGANA_KATAKANA_RE.findall(text))
+        if cjk_kana > 0 or source_lang.startswith(("zh", "ja")):
+            return cjk_kana
+    if source_lang.startswith("ko"):
+        return len(HANGUL_RE.findall(text))
+    if source_lang.startswith(("ru", "uk", "bg")):
+        return len(CYRILLIC_RE.findall(text))
+    if source_lang.startswith(("ar", "fa", "ur")):
+        return len(ARABIC_RE.findall(text))
+    return len(text)
 
 
 def detect_untranslated_residue(text: str, source_lang: str, target_lang: str):
     """Return a description of untranslated source script characters if found in target text."""
     if not text:
         return None
+    # Exempt translator notes
+    if TL_NOTE_RE.search(text):
+        return None
+    # Strip censored blocks such as ■■ェ■■■ before checking residue
+    cleaned = CENSOR_BLOCK_RE.sub('', text)
+
     tgt_is_cjk = target_lang.startswith(("zh", "ja"))
     tgt_is_ko = target_lang.startswith("ko")
     tgt_is_cyr = target_lang.startswith(("ru", "uk", "bg"))
     tgt_is_ar = target_lang.startswith(("ar", "fa", "ur"))
 
     if not tgt_is_cjk:
-        cjk_matches = CJK_UNIFIED_RE.findall(text)
-        kana_matches = HIRAGANA_KATAKANA_RE.findall(text)
+        cjk_matches = CJK_UNIFIED_RE.findall(cleaned)
+        kana_matches = HIRAGANA_KATAKANA_RE.findall(cleaned)
         if cjk_matches or kana_matches:
             sample = "".join((cjk_matches + kana_matches)[:6])
             return f"Untranslated CJK/Kana characters left in output: '{sample}'"
     elif target_lang.startswith("zh"):
-        # Chinese target should not contain Japanese kana unless intentional
-        kana_matches = HIRAGANA_KATAKANA_RE.findall(text)
+        kana_matches = HIRAGANA_KATAKANA_RE.findall(cleaned)
         if len(kana_matches) >= 2:
             sample = "".join(kana_matches[:6])
             return f"Untranslated Japanese Kana left in Chinese output: '{sample}'"
 
     if not tgt_is_ko:
-        ko_matches = HANGUL_RE.findall(text)
+        ko_matches = HANGUL_RE.findall(cleaned)
         if ko_matches:
             sample = "".join(ko_matches[:6])
             return f"Untranslated Korean Hangul characters left in output: '{sample}'"
 
     if not tgt_is_cyr and source_lang.startswith(("ru", "uk", "bg")):
-        cyr_matches = CYRILLIC_RE.findall(text)
+        cyr_matches = CYRILLIC_RE.findall(cleaned)
         if cyr_matches:
             sample = "".join(cyr_matches[:6])
             return f"Untranslated Cyrillic characters left in output: '{sample}'"
 
     if not tgt_is_ar and source_lang.startswith(("ar", "fa", "ur")):
-        ar_matches = ARABIC_RE.findall(text)
+        ar_matches = ARABIC_RE.findall(cleaned)
         if ar_matches:
             sample = "".join(ar_matches[:6])
             return f"Untranslated Arabic script characters left in output: '{sample}'"
@@ -148,13 +212,10 @@ def is_pure_dialogue_line(src_plain: str, tgt_plain: str) -> bool:
     """True if the line is purely spoken dialogue without narrative attribution outside quotes."""
     if not src_plain or not tgt_plain:
         return False
-    # Check if source starts and ends with dialogue quotes and has no middle narrative bridge
     if DIALOGUE_OPEN_RE.match(src_plain) and DIALOGUE_CLOSE_SRC_RE.search(src_plain):
-        # Ensure it doesn't contain narrative interruption like 」〇〇は言った。「
         inner = src_plain.strip()[1:-1]
         if "」" not in inner and "』" not in inner:
             return True
-    # Also check target if it starts and ends with double quotes and has no attribution like 'he said.'
     if tgt_plain.startswith('"') and tgt_plain.endswith('"') and tgt_plain.count('"') == 2:
         return True
     return False
@@ -165,35 +226,37 @@ def has_source_pronoun(src_plain: str, source_lang: str) -> bool:
         return bool(JA_PRONOUN_RE.search(src_plain))
     if source_lang.startswith("ko"):
         return bool(KO_PRONOUN_RE.search(src_plain))
-    # Default for zh or auto with CJK
     return bool(ZH_PRONOUN_RE.search(src_plain) or JA_PRONOUN_RE.search(src_plain))
 
 
 def compute_chunk_risk_tier(chunk_num: int, total_chunks: int, slines: list, meta_path: Path):
-    """Determine if a chunk is High-Risk (opening/closing chunk, chapter boundary, high new entities, or heavy dialogue)."""
+    """Determine if a chunk is High-Risk (opening/closing chunk, heavy multi-scene transitions, or glossary conflicts)."""
     reasons = []
-    if chunk_num <= 2:
-        reasons.append("Opening chunk of volume (sets narrative voice & tone)")
-    if total_chunks > 0 and chunk_num >= total_chunks - 1:
-        reasons.append("Closing/climax chunk of volume")
+    is_opening_or_closing = False
+    if chunk_num == 1:
+        reasons.append("Opening chunk of volume")
+        is_opening_or_closing = True
+    if total_chunks > 2 and chunk_num == total_chunks:
+        reasons.append("Closing chunk of volume")
+        is_opening_or_closing = True
 
     header_count = sum(1 for l in slines if SCENE_BREAK_OR_HEADER_RE.search(l))
-    if header_count >= 2:
-        reasons.append(f"Contains {header_count} section/chapter transitions (POV switch risk)")
+    if header_count >= 4:
+        reasons.append(f"Contains {header_count} section/chapter transitions (high POV-switch density)")
 
     if meta_path.exists():
         try:
             mdata = json.loads(meta_path.read_text(encoding="utf-8"))
             new_ents = len(mdata.get("new_entities", []))
             conflicts = len(mdata.get("conflicts", []))
-            if new_ents >= 4:
+            if new_ents >= 6:
                 reasons.append(f"Introduces {new_ents} new entities")
             if conflicts > 0:
                 reasons.append(f"Reports {conflicts} glossary conflicts")
         except Exception:
             pass
 
-    return ("high" if reasons else "normal"), reasons
+    return ("high" if reasons else "normal"), reasons, is_opening_or_closing
 
 
 def scan_chunk_heuristics(
@@ -213,7 +276,14 @@ def scan_chunk_heuristics(
     mfile = temp_dir / f"output_{cid}.meta.json"
 
     if not sfile.exists() or not ofile.exists():
-        return {"chunk_id": cid, "risk_tier": "high", "risk_reasons": ["Missing source or output"], "flags": [], "audit_lines": []}
+        return {
+            "chunk_id": cid,
+            "risk_tier": "high",
+            "is_opening_or_closing": False,
+            "risk_reasons": ["Missing source or output"],
+            "flags": [],
+            "audit_lines": [],
+        }
 
     slines = sfile.read_text(encoding="utf-8").splitlines()
     olines = ofile.read_text(encoding="utf-8").splitlines()
@@ -222,11 +292,12 @@ def scan_chunk_heuristics(
     if already_flagged_lines is None:
         already_flagged_lines = set()
 
-    risk_tier, risk_reasons = compute_chunk_risk_tier(chunk_num, total_chunks, slines, mfile)
+    risk_tier, risk_reasons, is_opening_or_closing = compute_chunk_risk_tier(chunk_num, total_chunks, slines, mfile)
 
     # Pre-filter glossary terms that actually appear anywhere in this chunk
     full_src_text = "\n".join(slines)
     active_terms = []
+    character_target_names = set()
     for t in glossary_terms:
         if not isinstance(t, dict):
             continue
@@ -236,14 +307,18 @@ def scan_chunk_heuristics(
             continue
         if src_term in full_src_text:
             active_terms.append(t)
+            first_word = tgt_term.split()[0].strip(".,!?;:\"'()")
+            if len(first_word) >= 3 and first_word[0].isupper():
+                character_target_names.add(first_word.lower())
 
-    # Compute chunk median length ratio (target plain len / source plain len) on substantial lines
+    # Compute chunk median length ratio on lines that actually have substantial source-script characters
     ratios = []
     max_lines = min(len(slines), len(olines))
     for i in range(max_lines):
         sp = strip_tags(slines[i])
         tp = strip_tags(olines[i])
-        if len(sp) >= 15 and len(tp) >= 5:
+        src_script_cnt = count_source_script_chars(sp, source_lang)
+        if len(sp) >= 15 and src_script_cnt >= 10 and len(tp) >= 5:
             ratios.append(len(tp) / len(sp))
     median_ratio = statistics.median(ratios) if len(ratios) >= 5 else 2.2
 
@@ -268,7 +343,7 @@ def scan_chunk_heuristics(
                 existing["category"] = category
 
     dialogue_streak = 0
-    recent_scene_break = True  # Line 1 of a chunk or right after a header is a POV boundary
+    recent_scene_break = True
 
     for idx in range(max_lines):
         ln = idx + 1
@@ -289,27 +364,26 @@ def scan_chunk_heuristics(
         if residue:
             add_flag(ln, "high", "untranslated_residue", residue)
 
-        # 2. Glossary violation check (HIGH)
+        # 2. Glossary violation check (HIGH, plural/inflection tolerant)
         for t in active_terms:
             src_term = t.get("source", "")
             tgt_term = t.get("target", "")
             if src_term in splain:
-                # Check if target or any word of target (case-insensitive) appears in oplain
-                # Allow partial match for multi-word targets like "the Singularity" -> "Singularity"
-                core_tgt = re.sub(r'^(?:the|a|an)\s+', '', tgt_term, flags=re.IGNORECASE).strip()
-                if core_tgt.lower() not in oplain.lower() and tgt_term.lower() not in oplain.lower():
-                    # Check if any alias target or stem is present before flagging
-                    stem = core_tgt[:5].lower() if len(core_tgt) >= 6 else core_tgt.lower()
-                    if stem not in oplain.lower():
-                        add_flag(
-                            ln,
-                            "high",
-                            "glossary_violation",
-                            f"Glossary term '{src_term}' -> expected '{tgt_term}', not found in translated line",
-                        )
+                if not glossary_target_matches(tgt_term, oplain):
+                    # Check if any approved alias/note variant (e.g. 'door' when 门扉 is used as a physical door rather than 《门扉》)
+                    if src_term == "门扉" and f"《{src_term}》" not in splain and re.search(r'\bdoors?\b', oplain, re.IGNORECASE):
+                        continue
+                    add_flag(
+                        ln,
+                        "high",
+                        "glossary_violation",
+                        f"Glossary term '{src_term}' -> expected '{tgt_term}', not found in translated line",
+                    )
 
-        # 3. Length-ratio outlier (HIGH / MEDIUM)
-        if len(splain) >= 20:
+        # 3. Length-ratio outlier (HIGH / MEDIUM) — skip lines already in English/Latin in the source
+        src_script_cnt = count_source_script_chars(splain, source_lang)
+        latin_cnt = len(LATIN_ALPHA_RE.findall(splain))
+        if len(splain) >= 20 and src_script_cnt >= 12 and latin_cnt < src_script_cnt:
             ratio = len(oplain) / max(len(splain), 1)
             if ratio < median_ratio * 0.35:
                 add_flag(
@@ -318,7 +392,7 @@ def scan_chunk_heuristics(
                     "length_outlier",
                     f"Abnormally short translation (ratio={ratio:.2f} vs chunk median={median_ratio:.2f}) — possible dropped clause",
                 )
-            elif ratio > median_ratio * 2.8 and len(oplain) > 120:
+            elif ratio > median_ratio * 2.8 and len(oplain) > 120 and not TL_NOTE_RE.search(oplain):
                 add_flag(
                     ln,
                     "medium",
@@ -326,24 +400,27 @@ def scan_chunk_heuristics(
                     f"Abnormally long translation (ratio={ratio:.2f} vs chunk median={median_ratio:.2f}) — possible padding or injected note",
                 )
 
-        # 4. Unattributed consecutive dialogue runs (MEDIUM)
+        # 4. Unattributed consecutive dialogue runs (MEDIUM) — raised threshold (>= 6) & checks if recent lines name a speaker
         if is_pure_dialogue_line(splain, oplain):
             dialogue_streak += 1
-            if dialogue_streak == 4 or (dialogue_streak > 4 and dialogue_streak % 3 == 1):
-                add_flag(
-                    ln,
-                    "medium",
-                    "dialogue_run",
-                    f"Line {dialogue_streak} of an unattributed dialogue streak — verify speaker turn-taking & voice",
-                )
+            if dialogue_streak == 6 or (dialogue_streak > 6 and dialogue_streak % 5 == 1):
+                # Check if any of the previous 3 lines inside the streak mentioned a character name to anchor turn-taking
+                recent_window = " ".join(strip_tags(olines[max(0, idx - 3):idx + 1][j]) for j in range(len(olines[max(0, idx - 3):idx + 1]))).lower()
+                has_name_anchor = any(cname in recent_window for cname in character_target_names)
+                if not has_name_anchor:
+                    add_flag(
+                        ln,
+                        "medium",
+                        "dialogue_run",
+                        f"Line {dialogue_streak} of a long unattributed dialogue streak with no character names — verify speaker turn-taking",
+                    )
         else:
             dialogue_streak = 0
 
         # 5. Zero-pronoun / POV-shift risk in CJK sources (MEDIUM)
         is_cjk_src = source_lang in ("auto", "zh", "ja", "ko") or bool(CJK_UNIFIED_RE.search(splain))
-        if is_cjk_src and len(splain) >= 12:
+        if is_cjk_src and len(splain) >= 12 and src_script_cnt >= 8:
             if not has_source_pronoun(splain, source_lang):
-                # Source has NO explicit pronoun
                 if recent_scene_break and EN_THIRD_OR_FIRST_PRONOUN_RE.search(oplain):
                     add_flag(
                         ln,
@@ -387,7 +464,6 @@ def scan_chunk_heuristics(
     audit_lines = []
     if audit_rate > 0 and eligible_for_audit:
         target_audit_count = max(1, round(len(eligible_for_audit) * audit_rate))
-        # Deterministic sort using SHA-256 of (cid, line_num) so audit sample is reproducible across runs
         scored = sorted(
             eligible_for_audit,
             key=lambda ln: hashlib.sha256(f"{cid}:{ln}".encode("utf-8")).hexdigest(),
@@ -410,6 +486,7 @@ def scan_chunk_heuristics(
     return {
         "chunk_id": cid,
         "risk_tier": risk_tier,
+        "is_opening_or_closing": is_opening_or_closing,
         "risk_reasons": risk_reasons,
         "median_length_ratio": round(median_ratio, 2),
         "flags": heuristic_list,
