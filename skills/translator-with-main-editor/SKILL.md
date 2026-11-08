@@ -4,10 +4,11 @@ description: >-
   Translate any EPUB book or unzipped EPUB directory between any source and target
   language using a Translator + Main Editor pipeline: parallel fast-model subagents
   draft each chunk while preserving 100% of the XHTML tags, apply a live glossary, and
-  flag hard-to-interpret passages in `.review.json`; the strongest available model then
-  resolves every flagged nuance, idiom, omitted pronoun, and cross-chapter consistency
-  issue before the book is repackaged as a valid `.epub`. Use when the user asks to
-  translate an EPUB / light novel / ebook while keeping layout, images, and TOC intact.
+  score per-line translation certainty & severity in `.review.json`; deterministic
+  script heuristics (`auto_flag.py`) and a 5% random spot-audit catch overconfident
+  drafting errors (untranslated residue, glossary mismatches, length outliers,
+  zero-pronoun POV shifts, and unattributed dialogue streaks) before the strongest
+  available model resolves every flagged nuance and packages a valid `.epub`.
 ---
 
 # Translator with Main Editor (`translator-with-main-editor`)
@@ -29,7 +30,19 @@ Credits for the upstream project are in [CREDITS.md](CREDITS.md).
 
 - `scripts/epub_split.py`: extracts the `.epub` (or reads an unzipped directory), splits translatable `.xhtml` spine files along balanced DOM block boundaries into `chunkNNNN.md`, writes `manifest.json` and `epub_map.json`, seeds `glossary.json`, and counts term frequencies in any Unicode script.
 - `scripts/prep_batch.py`: prints per-chunk glossary term tables and read-only ±300-char neighbor context for a batch of chunks in one call.
-- `scripts/review_flags.py`: `dump` aggregates flagged passages from `output_chunkNNNN.review.json`; `validate` checks XML well-formedness (`--fix-markdown-italics` repairs stray `*italics*`). Both accept `--chunks '1-8,11-20'`.
+- `scripts/auto_flag.py`: deterministic, zero-token script-side difficulty and error detector. Scans source + draft output for:
+  1. Untranslated source-script residue (`high`)
+  2. Glossary violations where a glossary source term appears on line $L$ of `chunkNNNN.md` but its canonical target is missing on line $L$ of `output_chunkNNNN.md` (`high`)
+  3. Source-to-output length-ratio outliers indicating dropped clauses or hallucinated padding (`high` / `medium`)
+  4. Unattributed consecutive dialogue streaks ($\ge 4$ quote-only lines in a row) (`medium`)
+  5. Zero-pronoun / POV-shift ambiguity in pro-drop languages (`ja`/`zh`/`ko`) where the source has no explicit pronoun (`私/僕/俺/我/你/他/她`) but the translation injects `I/he/she` across a section boundary or gendered pronouns in dialogue (`medium`)
+  6. `<ruby>`/`<rt>`, bouten (`em-sesame`), or blank-quote wordplay markup (`low`)
+  7. Chunk-level **Risk Tiers** (`HIGH` for opening/closing chunks, multi-section transitions, or high new-entity/conflict counts)
+  8. Deterministic **5% Random Spot-Audit** (`[AUDIT-5%]`) of unflagged lines.
+- `scripts/review_flags.py`:
+  - `dump`: merges Stage-1 model `.review.json` flags + `auto_flag.py` script heuristics + `5%` spot-audit lines, sorts by severity (`HIGH` $\rightarrow$ `MEDIUM` $\rightarrow$ `LOW` $\rightarrow$ `AUDIT-5%`), supports `--min-severity {low,medium,high}` and `--audit-rate`, and snapshots audited lines to `audit_snapshot.json`.
+  - `audit-report`: compares `audit_snapshot.json` against edited `output_chunkNNNN.md` files after Stage 2 to compute the **Measured Unflagged Miss Rate (%)** and alerts if $>10\%$.
+  - `validate`: checks XML well-formedness (`--fix-markdown-italics` repairs stray `*italics*`).
 - `scripts/glossary.py`: manages the v2 `glossary.json` (`count-frequencies`, `print-terms-for-chunk`, `compute-hash`).
 - `scripts/chunk_context.py`: extracts read-only previous/next chunk excerpts.
 - `scripts/run_state.py`: tracks per-chunk state and plans selective re-translation (`plan`, `record`, `record-all`, `status`).
@@ -60,7 +73,7 @@ python "<skill_dir>/scripts/run_state.py" plan "<work_dir>/book_temp"
 
 This lists the chunks that still need work, so an interrupted run resumes where it stopped. If the user says certain chunks were already translated by a strong model and must not be altered, exclude those IDs from every later step.
 
-### Step 3: Stage 1, Parallel Fast Drafters + Difficulty Flagging
+### Step 3: Stage 1, Parallel Fast Drafters + Structured Certainty Scoring
 
 Process `translation_chunk_ids` in batches of 5-10 parallel subagents.
 
@@ -95,12 +108,17 @@ Translate the XHTML fragment file `<temp_dir>/chunk<NNNN>.md` from <SOURCE_LANG>
 - **Neighbor Context (read-only; do NOT translate or include in output)**:
 {NEIGHBOR_CONTEXT}
 
-### 2. Difficulty Flagging File (`<temp_dir>/output_chunk<NNNN>.review.json`)
-Flag every passage that is hard to interpret, for example:
-- omitted subjects or ambiguous pronouns (zero-pronouns in Japanese/Chinese, "I" vs "he/she" misattribution)
-- wordplay, puns, literary or cultural allusions, idioms
-- unattributed rapid-fire dialogue or sudden POV switches
-- complex worldbuilding or lore terms, source typos or OCR defects
+### 2. Structured Per-Line Certainty Scoring (`<temp_dir>/output_chunk<NNNN>.review.json`)
+As you translate each non-trivial line, rate your translation certainty from `1` to `3`:
+- `3` = 100% certain (explicit subject/speaker, straightforward syntax, unambiguous meaning).
+- `2` = Context-dependent (inferred zero-pronoun subject/object, inferred speaker turn in dialogue, idiomatic phrasing, or tone/register choice).
+- `1` = Guessing / high ambiguity (wordplay/pun, cryptic lore mechanics, sudden unmarked POV shift, cultural allusion, or suspected source typo).
+
+**Mandatory rule**: Flag **EVERY** line rated `1` or `2`. Over-flagging is strongly encouraged: a false positive costs the Main Editor only a second to verify, whereas an unflagged wrong pronoun or missed nuance ships to the final book.
+Assign `"severity"`:
+- `"high"`: certainty `1`, or any line where picking the wrong pronoun/speaker/term flips the factual meaning of the scene.
+- `"medium"`: certainty `2` on narrative voice, dialogue turn-taking, or idiom adaptation.
+- `"low"`: minor stylistic polish or emphasis/punctuation preference.
 
 Format:
 ```json
@@ -110,14 +128,16 @@ Format:
   "flagged": [
     {
       "line": 42,
+      "certainty": 1,
+      "severity": "high",
       "source": "<exact source line>",
       "current_tl": "<your best draft translation>",
-      "issue": "<why this is ambiguous, for the Senior Reviewer>"
+      "issue": "<why certainty is <= 2 and what the Main Editor should verify>"
     }
   ]
 }
 ```
-If nothing is difficult, write `"has_difficult_passages": false` and `"flagged": []`.
+If every line in the chunk is `certainty: 3`, write `"has_difficult_passages": false` and `"flagged": []`.
 
 ### 3. Meta Feedback File (`<temp_dir>/output_chunk<NNNN>.meta.json`)
 ```json
@@ -140,20 +160,30 @@ If nothing is difficult, write `"has_difficult_passages": false` and `"flagged":
 
 ### Step 4: Stage 2, Senior Reviewer Pass (strongest available model, e.g. Argon, Pro, or Opus)
 
-The parent agent performs the editorial review once Stage 1 has finished.
+The parent agent performs the editorial review once Stage 1 has finished. Rather than relying solely on the fast model's self-reported confusion, `review_flags.py dump` automatically runs `auto_flag.py` to combine **model flags** + **deterministic script flags** + **chunk risk tiers** + a **5% random spot-audit** (`[AUDIT-5%]`).
 
-1. **Dump flagged passages.** For large books, review in volume or chapter slices to avoid overflowing context:
+1. **Dump prioritized review queue.** For large books, review in volume or chapter slices to avoid overflowing context:
    ```bash
-   python "<skill_dir>/scripts/review_flags.py" dump "<work_dir>/book_temp" --chunks "1-20" --out "<work_dir>/book_temp/all_flags.txt"
+   python "<skill_dir>/scripts/review_flags.py" dump "<work_dir>/book_temp" \
+     --chunks "1-20" \
+     --min-severity low \
+     --out "<work_dir>/book_temp/all_flags.txt"
    ```
-   Repeat with the next range until every chunk is covered.
-2. **Inspect and refine.** Read the dump (and surrounding lines of `chunkNNNN.md` / `output_chunkNNNN.md` when more context is needed). Resolve every omitted pronoun, attribution ambiguity, pun, allusion, header/TOC mismatch, and cross-chapter terminology discrepancy by editing `output_chunkNNNN.md` directly. Keep tags and line counts unchanged.
-3. **Validate and auto-fix stray Markdown italics**:
+   - Items inside each chunk are sorted by priority: `[HIGH]` $\rightarrow$ `[MEDIUM]` $\rightarrow$ `[LOW]` $\rightarrow$ `[AUDIT-5%]`.
+   - If token quota is tight, pass `--min-severity medium` or `--min-severity high` so critical errors (untranslated residue, glossary mismatches, dropped clauses, certainty-1 guesses, and dual model+script flags) are resolved first.
+   - Chunks marked `[RISK TIER: HIGH]` in the dump header (opening/closing chunks, multi-section transitions, or high new-entity counts) deserve full-scene voice scrutiny.
+2. **Inspect and refine.** Read the dump (and surrounding lines of `chunkNNNN.md` / `output_chunkNNNN.md` when more context is needed). Resolve every omitted pronoun, attribution ambiguity, glossary violation, pun, header/TOC mismatch, and `[AUDIT-5%]` line by editing `output_chunkNNNN.md` directly. Keep tags and line counts unchanged.
+3. **Check the Measured Spot-Audit Miss Rate**:
+   ```bash
+   python "<skill_dir>/scripts/review_flags.py" audit-report "<work_dir>/book_temp"
+   ```
+   This reports what percentage of the 5% random unflagged spot-audit lines required edits from the Main Editor. If the miss rate exceeds `10.0%`, perform a full-chunk read-through of `HIGH` risk-tier chunks.
+4. **Validate and auto-fix stray Markdown italics**:
    ```bash
    python "<skill_dir>/scripts/review_flags.py" validate "<work_dir>/book_temp" --fix-markdown-italics
    ```
    If validation still reports errors, open the named chunk, fix the offending line (usually an unescaped `&` or `<`, or a dropped closing tag), and re-run until clean.
-4. **Record completed chunks**:
+5. **Record completed chunks**:
    ```bash
    python "<skill_dir>/scripts/run_state.py" record-all "<work_dir>/book_temp"
    ```
@@ -176,9 +206,9 @@ The parent agent performs the editorial review once Stage 1 has finished.
 User: "Translate `Novel Vol1.epub` from Japanese to English."
 
 1. Split with `--source-lang ja --target-lang en`.
-2. Draft 40 chunks in batches of 8 with fast-model subagents.
-3. The reviewer dumps flags for chunks 1-20 and 21-40, fixes pronoun and pun issues, then validates.
-4. Merge, writing `Novel Vol1 (Translated).epub` and reporting any chunks that needed re-translation.
+2. Draft 40 chunks in batches of 8 with fast-model subagents (`certainty: 1|2` + `severity` in `.review.json`).
+3. The reviewer dumps merged model + `auto_flag.py` + `5%` spot-audit flags for chunks 1-20 and 21-40, fixes pronoun/glossary/pun issues, checks `audit-report`, and validates XML.
+4. Merge, writing `Novel Vol1 (Translated).epub` and reporting the final audit miss rate.
 
 ## Troubleshooting
 
@@ -186,6 +216,7 @@ User: "Translate `Novel Vol1.epub` from Japanese to English."
 |---|---|
 | Line count mismatch in a chunk | Re-spawn that subagent, stressing the 1-to-1 line rule |
 | `validate` reports XML errors | Fix the unescaped `&`/`<` or the missing closing tag, then re-run |
+| `audit-report` miss rate > 10% | Review `[RISK TIER: HIGH]` chunks in full or re-run `dump` with `--min-severity low` |
 | Glossary conflicts in `prepare-merge` | Decide the canonical term, then record it via `apply-merge` |
 | `epub_merge.py` refuses to run | Run `run_state.py status`, finish or re-translate the listed chunks |
-| Context window filling up | Use `--chunks` ranges for `dump` and `validate` |
+| Context window filling up | Use `--chunks` ranges and `--min-severity medium` for `dump` |
