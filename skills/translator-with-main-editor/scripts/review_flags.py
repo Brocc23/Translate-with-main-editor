@@ -215,7 +215,7 @@ def cmd_dump(args):
         filtered_items.sort(key=lambda x: (-SEVERITY_RANK.get(x["severity"], 0), x["line"]))
 
         risk_badge = f" [RISK TIER: HIGH — {'; '.join(auto_res['risk_reasons'])}]" if auto_res["risk_tier"] == "high" else ""
-        lines_out.append(f"=== CHUNK {c:04d} ({len(filtered_items)} items){risk_badge} ===")
+        lines_out.append(f"=== CHUNK {c:04d} ({len(filtered_items)} flagged items){risk_badge} ===")
         for item in filtered_items:
             total_flags += 1
             ln = item["line"]
@@ -229,6 +229,20 @@ def cmd_dump(args):
                 lines_out.append(f"  Prev (L{ln-1}): {olines[ln-2]}")
             if 1 <= ln < len(olines):
                 lines_out.append(f"  Next (L{ln+1}): {olines[ln]}")
+
+        if auto_res["risk_tier"] == "high" and args.high_risk_mode == "full":
+            lines_out.append(f"--- FULL CHUNK REVIEW: {cid} ({len(slines)} lines, High-Risk Chunk) ---")
+            max_ln = max(len(slines), len(olines))
+            for idx in range(max_ln):
+                ln = idx + 1
+                s_l = slines[idx] if idx < len(slines) else ""
+                o_l = olines[idx] if idx < len(olines) else ""
+                flag_tag = ""
+                if ln in merged_by_line:
+                    finfo = merged_by_line[ln]
+                    flag_tag = f"  <-- [{finfo['severity'].upper()}: {finfo['detector']}]"
+                lines_out.append(f"  L{ln:03d} SRC: {s_l}")
+                lines_out.append(f"  L{ln:03d} CUR: {o_l}{flag_tag}")
         lines_out.append("")
 
     if updated_snap and not args.no_auto_flag and args.audit_rate > 0:
@@ -355,10 +369,11 @@ def main():
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    p_dump = sub.add_parser("dump", help="Dump merged model + auto_flag + 5%% spot-audit passages sorted by severity")
+    p_dump = sub.add_parser("dump", help="Dump merged model + auto_flag + 5%% spot-audit passages sorted by severity (plus full-chunk dump for High-Risk chunks)")
     p_dump.add_argument("temp_dir", help="Path to working chunk directory")
     p_dump.add_argument("--chunks", default=None, help="Optional chunk range filter, e.g. '1-8,11-20'")
-    p_dump.add_argument("--min-severity", choices=["low", "medium", "high"], default="low", help="Minimum flag severity to include (default: low)")
+    p_dump.add_argument("--min-severity", choices=["low", "medium", "high"], default="low", help="Minimum flag severity to include (default: low = full review)")
+    p_dump.add_argument("--high-risk-mode", choices=["full", "flags"], default="full", help="For High-Risk chunks, dump the entire chunk ('full', default) or only flagged lines ('flags')")
     p_dump.add_argument("--audit-rate", type=float, default=0.05, help="Fraction of unflagged lines to sample for 5%% random spot-audit (default: 0.05, 0 to disable)")
     p_dump.add_argument("--no-auto-flag", action="store_true", help="Disable deterministic script-side heuristics and dump only model .review.json flags")
     p_dump.add_argument("--reset-audit-snapshot", action="store_true", help="Overwrite existing audit_snapshot.json baseline with current chunk lines")
