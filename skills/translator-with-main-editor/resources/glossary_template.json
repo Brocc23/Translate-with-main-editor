@@ -1,4 +1,30 @@
 {
-  "schema_version": 2,
-  "terms": {}
+  "version": 2,
+  "terms": [
+    {
+      "id": "Aria",
+      "source": "ã‚¢ãƒªã‚¢",
+      "target": "Aria",
+      "category": "person",
+      "aliases": [],
+      "gender": "female",
+      "confidence": "high",
+      "frequency": 0,
+      "evidence_refs": [],
+      "notes": "Protagonist. Example entry; replace or delete."
+    },
+    {
+      "id": "Silverreach",
+      "source": "éŠ€ã®é‡Œ",
+      "target": "Silverreach",
+      "category": "place",
+      "aliases": [],
+      "gender": "unknown",
+      "confidence": "medium",
+      "frequency": 0,
+      "evidence_refs": [],
+      "notes": "Example place name."
+    }
+  ]
 }
+
